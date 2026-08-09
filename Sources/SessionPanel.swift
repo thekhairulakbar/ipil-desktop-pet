@@ -24,7 +24,13 @@ final class SessionRowView: NSView {
 
     var onDismiss: (() -> Void)?
     var onOpen: (() -> Void)?
+    var onPromote: (() -> Void)?
     var onReply: ((String) -> SessionReply.SendResult)?
+
+    // Deck stacking: the front card is fully visible; back cards only peek a
+    // title strip. A click on a peeked card brings it forward instead of
+    // jumping to Claude — you promote first, read, then click through.
+    var isFront = true
 
     var replyOpen = false {
         didSet { applyLayout() }
@@ -50,6 +56,9 @@ final class SessionRowView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor(white: 0.13, alpha: 0.95).cgColor
         layer?.cornerRadius = 12
+        // Hairline edge so overlapped deck cards read as separate pills
+        layer?.borderColor = NSColor(white: 1, alpha: 0.09).cgColor
+        layer?.borderWidth = 1
 
         statusDot.wantsLayer = true
         statusDot.layer?.cornerRadius = 3.5
@@ -122,6 +131,7 @@ final class SessionRowView: NSView {
     @objc private func toggleReply() {
         replyOpen.toggle()
         if replyOpen {
+            onPromote?() // typing always happens on the front card
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             window?.makeFirstResponder(replyField)
@@ -170,7 +180,11 @@ final class SessionRowView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        onOpen?()
+        if isFront {
+            onOpen?()
+        } else {
+            onPromote?()
+        }
     }
 
     @objc private func dismissRow() {
@@ -254,6 +268,9 @@ final class SessionPanel {
     private var window: PanelWindow?
     private var rows: [String: SessionRowView] = [:]
     private var dismissed: [String: Date] = [:]
+    // The card the user pulled to the front (reply open, answer delivered, or
+    // a click on a peeked card). nil = live ordering: most recent activity wins.
+    private var pinnedId: String?
     var userHidden = false
     var suspended = false // true while the Claude app is not running
 
@@ -285,8 +302,22 @@ final class SessionPanel {
     }
 
     private func layout(_ infos: [SessionInfo]) {
-        let spacing: CGFloat = 5
+        // GPT-pet-style deck: the active card sits in front at full height,
+        // inactive cards stack BEHIND it, each peeking only a title strip.
+        // 4 sessions ≈ 121pt instead of the old 235pt column that walled off
+        // the screen above Ipil.
+        let peek: CGFloat = 22
         let width = SessionRowView.rowWidth
+
+        // Front card: the pinned one if the user pulled something forward,
+        // otherwise the most recently active session (watcher order).
+        var ordered = infos
+        if pinnedId != nil, !ordered.contains(where: { $0.id == pinnedId }) {
+            pinnedId = nil
+        }
+        if let pid = pinnedId, let idx = ordered.firstIndex(where: { $0.id == pid }), idx > 0 {
+            ordered.insert(ordered.remove(at: idx), at: 0)
+        }
 
         let w: PanelWindow
         if let existing = window {
@@ -310,7 +341,7 @@ final class SessionPanel {
 
         var orderedRows: [SessionRowView] = []
         var newRows: [String: SessionRowView] = [:]
-        for info in infos {
+        for info in ordered {
             let row: SessionRowView
             if let existing = rows[info.id] {
                 existing.apply(info)
@@ -320,12 +351,22 @@ final class SessionPanel {
                 row.onDismiss = { [weak self] in
                     guard let self else { return }
                     self.dismissed[info.id] = Date()
+                    if self.pinnedId == info.id { self.pinnedId = nil }
                     self.rows[info.id]?.removeFromSuperview()
                     self.rows[info.id] = nil
                     self.update(with: self.latestInfos)
                 }
                 row.onOpen = { [weak self] in
-                    self?.onOpen?(info)
+                    guard let self else { return }
+                    // Clicking through to Claude releases the pin — the deck
+                    // goes back to live most-recent-first ordering.
+                    if self.pinnedId == info.id { self.pinnedId = nil }
+                    self.onOpen?(info)
+                }
+                row.onPromote = { [weak self] in
+                    guard let self else { return }
+                    self.pinnedId = info.id
+                    self.update(with: self.latestInfos)
                 }
                 row.onReply = { [weak self] text in
                     self?.onReply?(info, text) ?? .noCLI
@@ -343,8 +384,11 @@ final class SessionPanel {
         }
         rows = newRows
 
-        let height = orderedRows.reduce(0) { $0 + $1.height }
-            + CGFloat(max(0, orderedRows.count - 1)) * spacing
+        guard let front = orderedRows.first else {
+            w.orderOut(nil)
+            return
+        }
+        let height = front.height + CGFloat(orderedRows.count - 1) * peek
 
         if abs(w.frame.height - height) > 0.5 || abs(w.frame.width - width) > 0.5 {
             var frame = w.frame
@@ -354,11 +398,27 @@ final class SessionPanel {
         }
         container.setFrameSize(NSSize(width: width, height: height))
 
-        var y = height
-        for row in orderedRows {
-            y -= row.height
-            row.setFrameOrigin(NSPoint(x: 0, y: y))
-            y -= spacing
+        // Front card at the bottom (nearest Ipil), fully visible. Each card
+        // behind it climbs `peek` points, showing only its dot + title strip.
+        for (i, row) in orderedRows.enumerated() {
+            if i == 0 {
+                row.setFrameOrigin(NSPoint(x: 0, y: 0))
+                row.isFront = true
+                row.alphaValue = 1
+            } else {
+                let top = front.height + CGFloat(i) * peek
+                row.setFrameOrigin(NSPoint(x: 0, y: top - row.height))
+                row.isFront = false
+                row.alphaValue = 0.92
+            }
+        }
+        // z-order: deepest card at the back, front card drawn last. Re-stack
+        // only when the order actually changed — re-adding subviews mid-typing
+        // would drop the reply field's focus.
+        let desired = orderedRows.reversed().map { ObjectIdentifier($0) }
+        let current = container.subviews.compactMap { $0 as? SessionRowView }.map { ObjectIdentifier($0) }
+        if current != desired {
+            for row in orderedRows.reversed() { container.addSubview(row) }
         }
         if !w.isVisible { w.orderFront(nil) }
     }
@@ -384,6 +444,12 @@ final class SessionPanel {
         guard let row = rows[sessionId] else {
             SessionReply.log("pill[\(sessionId.prefix(8))] answer arrived but the pill is gone")
             return
+        }
+        // Bring the answer to the front of the deck — unless Khairul is mid-
+        // typing in another card, in which case the answer waits behind it
+        // (it is sticky; promoting the card later still shows it).
+        if !rows.values.contains(where: { $0.replyOpen }) {
+            pinnedId = sessionId
         }
         row.showAnswer(text)
         update(with: latestInfos) // re-layout for the taller row
